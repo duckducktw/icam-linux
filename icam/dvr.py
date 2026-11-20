@@ -140,3 +140,71 @@ def probe(host, port=80, user=None, password=None, scheme="http", timeout=6):
         return False, "串流格式不符（可能不是 iCatch 主機）"
     chans = sorted({c for t, c, _w, _h, _p in iter_sub_chunks(got[0]) if t in VIDEO_TYPES})
     return True, "OK，通道: %s" % (",".join(str(c) for c in chans) or "無")
+
+
+def pull_bodies(profile, channel, beg=None, end=None, seg_secs=300, fps=20.0,
+                should_stop=None, on_segment=None, timeout=15):
+    """持續產出 multipart 段的 body。
+
+    - beg/end 皆為 None → 即時串流（單一連線，直到 should_stop 或斷線）
+    - 有 beg/end → 歷史錄影，自動**分段**（每段 seg_secs 秒）重新連線，
+      避免長時間佔住 DVR 的單一連線（舊版一次拉整段會卡死）。
+
+    on_segment(第幾段, 總段數, beg, end) 會在每段開始前呼叫。
+    """
+    import requests
+
+    host = profile.get("host", "")
+    port = int(profile.get("port", 80))
+    scheme = profile.get("scheme", "http")
+    auth = (profile.get("user", ""), profile.get("password", ""))
+    if not host:
+        return
+
+    if beg is None or end is None:
+        segments = [(None, None)]
+    else:
+        segments = []
+        cur, end = int(beg), int(end)
+        while cur < end:
+            nxt = min(cur + int(seg_secs), end)
+            segments.append((cur, nxt))
+            cur = nxt
+        if not segments:
+            return
+
+    for idx, (b, e) in enumerate(segments):
+        if should_stop and should_stop():
+            return
+        if on_segment:
+            on_segment(idx, len(segments), b, e)
+        url = build_url(host, channel, port=port, scheme=scheme,
+                        beg=b if b is not None else -1,
+                        end=e if e is not None else -1)
+        expected = int((e - b) * fps) if b is not None else None
+        got = 0
+        splitter = MultipartSplitter()
+        pending = []
+        splitter.callback = pending.append
+        try:
+            with requests.get(url, auth=auth, stream=True, timeout=timeout) as r:
+                if r.status_code != 200:
+                    raise RuntimeError("HTTP %s" % r.status_code)
+                for chunk in r.iter_content(16384):
+                    if should_stop and should_stop():
+                        return
+                    splitter.feed(chunk)
+                    while pending:
+                        body = pending.pop(0)
+                        got += sum(1 for t, *_ in iter_sub_chunks(body)
+                                   if t in VIDEO_TYPES)
+                        yield body
+                    if expected and got >= expected:
+                        break
+        except Exception as exc:
+            if b is None:      # 即時串流：讓呼叫端重連
+                raise
+            # 錄影某一段抓不到（可能跨到沒錄影的時段）→ 換下一段
+            if on_segment:
+                on_segment(idx, len(segments), b, e, str(exc))
+            continue

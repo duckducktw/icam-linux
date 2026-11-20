@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize, QTimer, QDateTime
+from PySide6.QtCore import Qt, QSize, QTimer, QDateTime, QThread, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout,
@@ -22,6 +22,22 @@ from .player import StreamWorker, ffmpeg_bin
 HINT = "雙擊放大 · F 全螢幕 · S 截圖 · R 錄影 · Delete 移除"
 
 
+class _Worker(QThread):
+    """把會卡住 UI 的阻塞呼叫（ONVIF 掃描、取流、連線測試）丟到背景跑。"""
+
+    done = Signal(object, object)   # (結果, 錯誤訊息或 None)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self.fn(), None)
+        except Exception as e:      # noqa: BLE001 - 一律回報給 UI
+            self.done.emit(None, str(e))
+
+
 class CameraTile(QWidget):
     def __init__(self, cam, cfg, parent=None):
         super().__init__(parent)
@@ -32,6 +48,7 @@ class CameraTile(QWidget):
         self.setAutoFillBackground(False)
         self.selected = False
         self.maximized = False
+        self._locked_state = None
         self.image = None
         self.state = "待機"
         self._rec = None
@@ -57,6 +74,13 @@ class CameraTile(QWidget):
         self.update()
 
     def _on_state(self, txt):
+        if self._locked_state:
+            return          # 結束標籤已鎖定（避免收尾訊號蓋掉「回放結束」）
+        self.state = txt
+        self.update()
+
+    def lock_state(self, txt):
+        self._locked_state = txt
         self.state = txt
         self.update()
 
@@ -214,17 +238,19 @@ class DiscoverDialog(QDialog):
         QTimer.singleShot(50, self.scan)
 
     def scan(self):
-        self.status.setText("掃描中…")
+        self.status.setText("掃描中…（約 5 秒，可繼續操作視窗）")
         self.btn_scan.setEnabled(False)
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents()
         self.list.clear()
-        try:
-            devs = onvif.discover()
-        except Exception as e:
-            devs = []
-            self.status.setText("掃描失敗: %s" % e)
-        for d in devs:
+        self._scan = _Worker(lambda: onvif.discover(), self)
+        self._scan.done.connect(self._scan_done)
+        self._scan.start()
+
+    def _scan_done(self, devs, err):
+        if err:
+            self.status.setText("掃描失敗: %s" % err)
+            self.btn_scan.setEnabled(True)
+            return
+        for d in devs or []:
             item = QListWidgetItem("%s  %s  %s" % (d["ip"], d["name"], d["hardware"]))
             item.setData(Qt.UserRole, d)
             self.list.addItem(item)
@@ -232,7 +258,7 @@ class DiscoverDialog(QDialog):
             self.list.setCurrentRow(0)
             self.status.setText("找到 %d 台" % len(devs))
         else:
-            self.status.setText("沒找到 ONVIF 裝置")
+            self.status.setText("沒找到 ONVIF 裝置（有線/無線不同網段時掃不到）")
         self.btn_scan.setEnabled(True)
 
     def use_selected(self):
@@ -242,14 +268,24 @@ class DiscoverDialog(QDialog):
             return
         d = item.data(Qt.UserRole)
         self.status.setText("取流中…")
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents()
-        uri, msg = onvif.get_stream_uri(d["xaddr"] or "http://%s/onvif/device_service" % d["ip"],
-                                        self.user.text().strip(), self.pwd.text())
+        xaddr = d["xaddr"] or "http://%s/onvif/device_service" % d["ip"]
+        user, pwd = self.user.text().strip(), self.pwd.text()
+        self.btn_use.setEnabled(False)
+        self._use = _Worker(lambda: onvif.get_stream_uri(xaddr, user, pwd), self)
+        self._use.done.connect(self._use_done)
+        self._use.start()
+
+    def _use_done(self, res, err):
+        self.btn_use.setEnabled(True)
+        if err:
+            self.status.setText("取流失敗: %s" % err)
+            return
+        uri, msg = res
         if not uri:
             self.status.setText("取流失敗: %s（可改用手動網址）" % msg)
             return
-        self.picked = {"name": d["name"] or d["ip"], "url": uri, "transport": "tcp"}
+        self.picked = {"name": self.list.currentItem().data(Qt.UserRole)["name"] or "ONVIF",
+                       "url": uri, "transport": "tcp"}
         self.accept()
 
     def manual(self):
@@ -303,9 +339,17 @@ class DvrDialog(QDialog):
     def test(self):
         p = self.profile()
         self.status.setText("測試中…")
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents()
-        ok, msg = onvif_dvr_probe(p)
+        self.btn_test.setEnabled(False)
+        self._t = _Worker(lambda: onvif_dvr_probe(p), self)
+        self._t.done.connect(lambda res, err: self._test_done(p, res, err))
+        self._t.start()
+
+    def _test_done(self, p, res, err):
+        self.btn_test.setEnabled(True)
+        if err:
+            self.status.setText("失敗：%s" % err)
+            return
+        ok, msg = res
         if ok and p["channels"] <= 0 and "通道: " in msg:
             nums = [x for x in msg.split("通道: ", 1)[1].split(",") if x.strip().isdigit()]
             if nums:
@@ -384,6 +428,7 @@ class PlaybackWindow(QDialog):
             self.slider.setValue(self.offset)
             if self.offset >= self.dur:
                 self.pause()
+                self.tile.lock_state("回放結束")
         self.lbl.setText(self._label())
 
     def seek(self):
@@ -391,6 +436,7 @@ class PlaybackWindow(QDialog):
         self.restart()
 
     def restart(self):
+        self.tile._locked_state = None
         self.tile.stop()
         self.tile.cam["url"] = self._url(self.base_offset)
         self.tile.worker.url = self.tile.cam["url"]
@@ -615,6 +661,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("DVR %s 已設定，%d 路" % (prof["host"], n))
 
     def open_playback(self):
+        if not (self.cfg.get("dvr") or {}).get("host"):
+            QMessageBox.information(self, "回放", "先設定 DVR 主機")
+            return
         dlg = PlaybackDialog(self, self.cfg)
         dlg.exec()
 

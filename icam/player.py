@@ -38,6 +38,8 @@ class StreamWorker(QThread):
         self._feeder = None
         self._frames_sent = 0
         self._expected = 0
+        self._low_warned = False
+        self._finish_label = None
 
     # ---- 來源型別 ----
     @property
@@ -73,7 +75,7 @@ class StreamWorker(QThread):
         if self.is_dvr:
             # 自行拆好的 Annex-B H.264 從 stdin 進來；DVR 沒給時戳，用系統時鐘補
             args += ["-fflags", "+genpts+igndts", "-use_wallclock_as_timestamps", "1",
-                     "-probesize", "500000", "-analyzeduration", "500000",
+                     "-probesize", "40000", "-analyzeduration", "0",
                      "-f", "h264", "-i", "pipe:0"]
         else:
             local = not self.url.lower().startswith(
@@ -110,6 +112,7 @@ class StreamWorker(QThread):
                 self._feeder.start()
             buf = bytearray()
             got_any = False
+            t_first = None
             while not self._stop:
                 chunk = self._proc.stdout.read(need - len(buf))
                 if not chunk:
@@ -121,7 +124,9 @@ class StreamWorker(QThread):
                     buf.clear()
                     if not got_any:
                         got_any = True
-                        self.stateChanged.emit("播放中")
+                        t_first = time.time()
+                        self.stateChanged.emit("播放中（訊號極弱）" if self._low_warned
+                                               else "播放中")
                     self.frameReady.emit(img)
             self._kill()
             if self._stop:
@@ -131,77 +136,76 @@ class StreamWorker(QThread):
                 if self._stop:
                     break
                 time.sleep(0.1)
-        self.stateChanged.emit("已停止")
+        self.stateChanged.emit(self._finish_label or "已停止")
 
     # ---- DVR 拆流 → ffmpeg stdin ----
     def _feed_dvr(self):
         p = self.dvr_profile
-        host = p.get("host", "")
-        port = int(p.get("port", 80))
         ch = self.dvr_channel()
         beg, end = self.dvr_range()
-        url = dvrmod.build_url(host, ch, port=port, scheme=p.get("scheme", "http"),
-                               beg=beg if beg is not None else -1,
-                               end=end if end is not None else -1)
         pace = float(p.get("pace_fps", 0) or 0) if beg is not None else 0.0
+        proc = self._proc
+        if not p.get("host") or not proc or not proc.stdin:
+            return
         if beg is not None and end is not None and pace > 0:
             self._expected = int((end - beg) * pace)
-        proc = self._proc
-        if not host or not proc or not proc.stdin:
-            return
-        import requests
-        splitter = dvrmod.MultipartSplitter()
-        wrote = False
+        seg_secs = int(p.get("seg_secs", 300) or 300)
+        wrote = [False]
         sent = [0]
         t_start = [None]
+        real = [0]
+        real_t0 = [time.monotonic()]
+        low_warn = [False]
 
-        def on_section(body):
-            nonlocal wrote
-            for stype, channel, _w, _h, payload in dvrmod.iter_sub_chunks(body):
-                if channel != ch or stype not in dvrmod.VIDEO_TYPES or not payload:
-                    continue
-                try:
-                    proc.stdin.write(payload)
-                    proc.stdin.flush()
-                    wrote = True
-                except (BrokenPipeError, ValueError, OSError):
-                    return
-                if self._expected and self._frames_sent >= self._expected:
-                    self.stateChanged.emit("回放結束")
-                    self._stop = True
-                    return
-                if pace > 0:
+        def feeding():
+            for body in dvrmod.pull_bodies(
+                    p, ch, beg, end, seg_secs=seg_secs, fps=pace or 20.0,
+                    should_stop=lambda: self._stop or proc.poll() is not None):
+                for stype, channel, _w, _h, payload in dvrmod.iter_sub_chunks(body):
+                    if channel != ch or stype not in dvrmod.VIDEO_TYPES or not payload:
+                        continue
+                    try:
+                        proc.stdin.write(payload)
+                        proc.stdin.flush()
+                        wrote[0] = True
+                    except (BrokenPipeError, ValueError, OSError):
+                        return
+                    real[0] += 1
+                    if not low_warn[0] and beg is None:
+                        el = time.monotonic() - real_t0[0]
+                        if el > 12 and real[0] / el < 1.5:
+                            low_warn[0] = True
+                            self._low_warned = True
+                            self.stateChanged.emit("無訊號（這路只有 %.1f fps）"
+                                                   % (real[0] / el))
+                    if pace <= 0:
+                        continue
                     # 回放：DVR 送得比實際時間快，靠張數配速到 pace_fps
-                    import time as _t
-                    now = _t.monotonic()
+                    now = time.monotonic()
                     if t_start[0] is None:
                         t_start[0] = now
                     sent[0] += 1
                     self._frames_sent = sent[0]
                     target = t_start[0] + sent[0] / pace
                     if target > now:
-                        _t.sleep(target - now)
+                        time.sleep(target - now)
 
-        splitter.callback = on_section
         try:
-            with requests.get(url, auth=(p.get("user", ""), p.get("password", "")),
-                              stream=True, timeout=15) as r:
-                if r.status_code != 200:
-                    self.stateChanged.emit("DVR 拒絕：HTTP %s" % r.status_code)
-                    return
-                for chunk in r.iter_content(chunk_size=32768):
-                    if self._stop or proc.poll() is not None:
-                        break
-                    splitter.feed(chunk)
+            feeding()
         except Exception as e:
             if not self._stop:
                 self.stateChanged.emit("DVR 斷線: %s" % e)
         finally:
+            if beg is not None:
+                # 回放段落播完（或整段沒錄影）→ 先定好結束標籤，再關 stdin 讓 ffmpeg 收尾
+                self._finish_label = "回放結束" if wrote[0] else "這段沒有錄影"
             try:
                 proc.stdin.close()
             except Exception:
                 pass
-            if not wrote and not self._stop:
+            if beg is not None:
+                self._stop = True
+            elif not wrote[0] and not self._stop:
                 self.stateChanged.emit("DVR 沒畫面")
 
     def _kill(self):
