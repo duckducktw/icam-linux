@@ -62,7 +62,13 @@ def _merge_env_secrets(cfg):
 
 def save(cfg):
     CFG_DIR.mkdir(parents=True, exist_ok=True)
+    out = dict(cfg)
+    env = CFG_DIR / "dvr.env"
+    if env.exists() and isinstance(out.get("dvr"), dict) and env.read_text(
+            encoding="utf-8", errors="ignore").find("DVR_PASS=") >= 0:
+        # 帳密已在 dvr.env，不要重複寫進 cameras.json
+        out["dvr"] = {k: v for k, v in out["dvr"].items() if k != "password"}
     tmp = CFG_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     os.chmod(tmp, 0o600)
     tmp.replace(CFG_FILE)
