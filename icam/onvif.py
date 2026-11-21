@@ -68,11 +68,16 @@ def _local_ipv4s():
     return uniq
 
 
-def discover(timeout=5.0):
-    """回傳 [{'ip','xaddr','name','hardware','location'}]。"""
+def discover(timeout=5.0, should_stop=None):
+    """回傳 [{'ip','xaddr','name','hardware','location'}]。
+
+    should_stop 是可取消的 callback（關掉掃描視窗時要能立刻停）。
+    """
     found = {}
     msg = PROBE.format(mid=uuid.uuid4()).encode()
     for iface in _local_ipv4s():
+        if should_stop and should_stop():
+            break
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
         try:
@@ -88,6 +93,8 @@ def discover(timeout=5.0):
             continue
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if should_stop and should_stop():
+                break
             try:
                 data, addr = s.recvfrom(65535)
             except socket.timeout:

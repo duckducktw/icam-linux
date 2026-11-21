@@ -69,20 +69,50 @@ class WelcomePanel(QWidget):
         lay.addWidget(foot)
 
 
+# 執行中的背景 worker 要在這裡保留參考：對話框關掉時若執行緒還活著，
+# QThread 被 GC／跟著父物件一起刪掉就會直接閃退，所以一律不放父物件、由這裡托管。
+_LIVE_WORKERS = set()
+
+
+def _start_worker(fn, on_done) -> "_Worker":
+    w = _Worker(fn)
+    _LIVE_WORKERS.add(w)
+    w.done.connect(on_done)
+    w.finished.connect(lambda: (_LIVE_WORKERS.discard(w), w.deleteLater()))
+    w.start()
+    return w
+
+
+def _cancel_worker(w):
+    """取消並斷開回呼，讓它自己在背景收尾（不等待、不閃退）。"""
+    if not w:
+        return
+    try:
+        w.done.disconnect()
+    except (TypeError, RuntimeError):
+        pass
+    w.cancelled.set()
+
+
 class _Worker(QThread):
     """把會卡住 UI 的阻塞呼叫（ONVIF 掃描、取流、連線測試）丟到背景跑。"""
 
     done = Signal(object, object)   # (結果, 錯誤訊息或 None)
 
-    def __init__(self, fn, parent=None):
-        super().__init__(parent)
+    def __init__(self, fn=None, parent=None):
+        super().__init__(None)      # 故意不設 parent：見上面 _LIVE_WORKERS 的說明
         self.fn = fn
+        self.cancelled = threading.Event()
 
     def run(self):
         try:
-            self.done.emit(self.fn(), None)
+            res = self.fn()
         except Exception as e:      # noqa: BLE001 - 一律回報給 UI
-            self.done.emit(None, str(e))
+            if not self.cancelled.is_set():
+                self.done.emit(None, str(e))
+            return
+        if not self.cancelled.is_set():
+            self.done.emit(res, None)
 
 
 class CameraTile(QWidget):
@@ -336,12 +366,23 @@ class DiscoverDialog(QDialog):
         QTimer.singleShot(50, self.scan)
 
     def scan(self):
+        if getattr(self, "_scan", None) and self._scan.isRunning():
+            return
         self.status.setText("掃描中…（約 5 秒，可繼續操作視窗）")
         self.btn_scan.setEnabled(False)
         self.list.clear()
-        self._scan = _Worker(lambda: onvif.discover(), self)
-        self._scan.done.connect(self._scan_done)
-        self._scan.start()
+        w = _Worker()
+        self._scan = w
+        w.fn = lambda: onvif.discover(should_stop=w.cancelled.is_set)
+        _LIVE_WORKERS.add(w)
+        w.done.connect(self._scan_done)
+        w.finished.connect(lambda: (_LIVE_WORKERS.discard(w), w.deleteLater()))
+        w.start()
+
+    def closeEvent(self, ev):
+        _cancel_worker(getattr(self, "_scan", None))
+        _cancel_worker(getattr(self, "_use", None))
+        super().closeEvent(ev)
 
     def _scan_done(self, devs, err):
         if err:
@@ -369,9 +410,8 @@ class DiscoverDialog(QDialog):
         xaddr = d["xaddr"] or "http://%s/onvif/device_service" % d["ip"]
         user, pwd = self.user.text().strip(), self.pwd.text()
         self.btn_use.setEnabled(False)
-        self._use = _Worker(lambda: onvif.get_stream_uri(xaddr, user, pwd), self)
-        self._use.done.connect(self._use_done)
-        self._use.start()
+        self._use = _start_worker(lambda: onvif.get_stream_uri(xaddr, user, pwd),
+                                  self._use_done)
 
     def _use_done(self, res, err):
         self.btn_use.setEnabled(True)
@@ -475,17 +515,26 @@ class DvrDialog(QDialog):
         self.status.setText("偵測中…（約 5-10 秒）")
         self.btn_test.setEnabled(False)
         self.list.clear()
-        self._t = _Worker(lambda: self._detect(p), self)
-        self._t.done.connect(lambda res, err: self._done(res, err))
-        self._t.start()
+        w = _Worker()
+        self._t = w
+        w.fn = lambda: self._detect(p, w.cancelled.is_set)
+        _LIVE_WORKERS.add(w)
+        w.done.connect(lambda res, err: self._done(res, err))
+        w.finished.connect(lambda: (_LIVE_WORKERS.discard(w), w.deleteLater()))
+        w.start()
 
-    def _detect(self, p):
+    def closeEvent(self, ev):
+        _cancel_worker(getattr(self, "_t", None))
+        super().closeEvent(ev)
+
+    def _detect(self, p, should_stop=None):
         from . import dvr as dvrmod
+        if should_stop and should_stop():
+            return []
         ok, msg = dvrmod.probe(p["host"], p["port"], p["user"], p["password"])
         if not ok:
             raise RuntimeError(msg)
-        return dvrmod.detect_channels(p, max_channels=16,
-                                      progress=lambda done, got: None)
+        return dvrmod.detect_channels(p, max_channels=16, should_stop=should_stop)
 
     def _done(self, res, err):
         self.btn_test.setEnabled(True)
