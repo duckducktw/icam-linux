@@ -20,6 +20,7 @@ except ImportError:
     raise
 
 from . import config, onvif
+from .appicon import app_icon
 from .ui import MainWindow
 
 
@@ -50,6 +51,9 @@ def main(argv=None):
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("iCam")
+    app.setApplicationDisplayName("iCam")
+    app.setDesktopFileName("icam")
+    app.setWindowIcon(app_icon())
     win = MainWindow(cfg)
     win.show()
 

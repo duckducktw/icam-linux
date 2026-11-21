@@ -8,18 +8,65 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, QTimer, QDateTime, QThread, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QKeySequence, QShortcut
+from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QImage, QPainter, QPixmap,
+                           QKeySequence, QShortcut)
 from PySide6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSlider, QVBoxLayout,
-    QWidget, QComboBox, QDateTimeEdit,
+    QWidget, QComboBox, QDateTimeEdit, QInputDialog, QMenu,
 )
 
 from . import config, onvif
 from .player import StreamWorker, ffmpeg_bin
 
 HINT = "雙擊放大 · F 全螢幕 · S 截圖 · R 錄影 · Delete 移除"
+
+
+def _icon(name, fallback=None):
+    """系統原生主題圖示，找不到才退回 Qt 內建標準圖示。"""
+    ic = QIcon.fromTheme(name)
+    if not ic.isNull() and ic.availableSizes():
+        return ic
+    return fallback or QIcon()
+
+
+class WelcomePanel(QWidget):
+    """沒有任何鏡頭時的引導畫面。"""
+
+    def __init__(self, on_dvr, on_onvif, on_manual, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignCenter)
+        title = QLabel("iCam")
+        f = title.font()
+        f.setPointSize(28)
+        f.setBold(True)
+        title.setFont(f)
+        title.setAlignment(Qt.AlignCenter)
+        lay.addWidget(title)
+        sub = QLabel("還沒有任何鏡頭。先選一種方式加入：")
+        sub.setAlignment(Qt.AlignCenter)
+        sub.setStyleSheet("color:#9aa4ae;")
+        lay.addWidget(sub)
+        lay.addSpacing(18)
+        for text, tip, slot in (
+            ("① 連線 DVR 主機", "iCatch / SoCatch 那種監視主機：填 IP 與帳密，通道會自動偵測",
+             on_dvr),
+            ("② 掃描網路攝影機", "區網內的 ONVIF 攝影機（例如 TP-Link Tapo）", on_onvif),
+            ("③ 手動輸入 RTSP 網址", "已經知道串流網址時使用", on_manual),
+        ):
+            b = QPushButton(text)
+            b.setMinimumWidth(320)
+            b.setMinimumHeight(44)
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            lay.addWidget(b, 0, Qt.AlignCenter)
+        lay.addSpacing(14)
+        foot = QLabel("設定存在 ~/.config/icam-linux/（帳密另存 dvr.env，權限 600）")
+        foot.setAlignment(Qt.AlignCenter)
+        foot.setStyleSheet("color:#6f7a85;")
+        lay.addWidget(foot)
 
 
 class _Worker(QThread):
@@ -39,6 +86,10 @@ class _Worker(QThread):
 
 
 class CameraTile(QWidget):
+    renamed = Signal(object)
+    ask_playback = Signal(object)
+    removed = Signal(object)
+
     def __init__(self, cam, cfg, parent=None):
         super().__init__(parent)
         self.cam = cam
@@ -127,6 +178,53 @@ class CameraTile(QWidget):
         if hasattr(win, "toggle_maximize"):
             win.toggle_maximize(self)
         ev.accept()
+
+    # ---- 右鍵選單（把常用操作集中在一格上）----
+    def contextMenuEvent(self, ev):
+        menu = QMenu(self)
+        win = self.window()
+        a_max = menu.addAction("縮小" if self.maximized else "放大這一格")
+        a_reconnect = menu.addAction("重新連線")
+        if self.cam["url"].startswith("dvr://"):
+            a_playback = menu.addAction("看這一格的錄影（回放）…")
+        else:
+            a_playback = None
+        menu.addSeparator()
+        a_snap = menu.addAction("截圖")
+        a_rec = menu.addAction("停止錄影" if self._rec else "開始錄影")
+        a_rename = menu.addAction("改名…")
+        menu.addSeparator()
+        a_remove = menu.addAction("從畫面移除")
+
+        chosen = menu.exec(ev.globalPos())
+        if chosen is None:
+            return
+        if chosen is a_max and hasattr(win, "toggle_maximize"):
+            win.toggle_maximize(self)
+        elif chosen is a_reconnect:
+            self.stop()
+            if self._locked_state:
+                self._locked_state = None
+            if self.worker.isFinished() or not self.worker.isRunning():
+                self.worker._stop = False
+                self.worker.start()
+        elif a_playback is not None and chosen is a_playback:
+            self.ask_playback.emit(self)
+        elif chosen is a_snap:
+            self.snapshot()
+        elif chosen is a_rec:
+            self.toggle_record()
+        elif chosen is a_rename:
+            self.rename()
+        elif chosen is a_remove:
+            self.removed.emit(self)
+
+    def rename(self):
+        name, ok = QInputDialog.getText(self, "改名", "名稱：", text=self.cam.get("name", ""))
+        if ok and name.strip():
+            self.cam["name"] = name.strip()
+            self.update()
+            self.renamed.emit(self)
 
     # ---- 截圖 / 錄影 ----
     def snapshot(self):
@@ -296,65 +394,121 @@ class DiscoverDialog(QDialog):
 
 
 class DvrDialog(QDialog):
-    """iCatch DVR（SoCatch 那台）設定：主機、帳密、自動接上所有通道。"""
+    """DVR 主機設定精靈：填 IP／帳密 → 自動偵測有影像的通道 → 勾選要看的。"""
 
     def __init__(self, parent=None, dvr=None):
         super().__init__(parent)
-        self.setWindowTitle("DVR 主機（iCatch / SoCatch）")
-        self.resize(460, 260)
+        self.setWindowTitle("DVR 主機設定")
+        self.resize(520, 470)
         dvr = dvr or {}
-        form = QFormLayout(self)
+        self.detected = []          # [{'channel','width','height','fps'}]
+        self.checked = set(dvr.get("channel_list") or [])
+
+        outer = QVBoxLayout(self)
+
+        form = QFormLayout()
         self.host = QLineEdit(dvr.get("host", ""))
         self.host.setPlaceholderText("192.168.0.150")
+        self.host.setToolTip("監視主機的 IP（區網內）")
         self.port = QLineEdit(str(dvr.get("port", 80)))
+        self.port.setToolTip("HTTP 埠，iCatch 主機通常是 80")
         self.user = QLineEdit(dvr.get("user", ""))
+        self.user.setPlaceholderText("admin")
         self.pwd = QLineEdit(dvr.get("password", ""))
         self.pwd.setEchoMode(QLineEdit.Password)
-        self.channels = QLineEdit(str(dvr.get("channels", 4)))
+        self.pwd.setToolTip("帳密只會存在 ~/.config/icam-linux/dvr.env（權限 600）")
         form.addRow("主機 IP", self.host)
-        form.addRow("HTTP 埠", self.port)
+        form.addRow("連接埠", self.port)
         form.addRow("帳號", self.user)
         form.addRow("密碼", self.pwd)
-        form.addRow("通道數", self.channels)
+        outer.addLayout(form)
+
         row = QHBoxLayout()
-        self.btn_test = QPushButton("測試連線")
+        self.btn_test = QPushButton("連線並偵測通道")
+        self.btn_test.setToolTip("測試帳密，並自動找出有接攝影機的通道")
         self.btn_test.clicked.connect(self.test)
         row.addWidget(self.btn_test)
-        form.addRow(row)
         self.status = QLabel("")
         self.status.setWordWrap(True)
-        form.addRow(self.status)
+        row.addWidget(self.status, 1)
+        outer.addLayout(row)
+
+        outer.addWidget(QLabel("偵測到的通道（取消勾選就不要加入畫面）："))
+        self.list = QListWidget()
+        self.list.setToolTip("fps 很低的通道通常是線沒接或壞掉（VIDEO LOSS）")
+        outer.addWidget(self.list, 1)
+
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("加入畫面")
+        bb.button(QDialogButtonBox.Cancel).setText("取消")
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
-        form.addRow(bb)
+        outer.addWidget(bb)
 
+    # ---- 資料 ----
     def profile(self):
         return {"host": self.host.text().strip(),
                 "port": int(self.port.text().strip() or 80),
                 "user": self.user.text().strip(),
                 "password": self.pwd.text(),
-                "channels": int(self.channels.text().strip() or 0)}
+                "channels": len(self.detected) or 0,
+                "channel_list": sorted(self._checked_channels()) or
+                                list(range(len(self.detected)))}
 
+    def _checked_channels(self):
+        out = []
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            if item.checkState() == Qt.Checked:
+                out.append(item.data(Qt.UserRole))
+        return out
+
+    # ---- 偵測 ----
     def test(self):
-        p = self.profile()
-        self.status.setText("測試中…")
+        p = {"host": self.host.text().strip(),
+             "port": int(self.port.text().strip() or 80),
+             "user": self.user.text().strip(),
+             "password": self.pwd.text()}
+        if not p["host"]:
+            self.status.setText("先填主機 IP")
+            return
+        self.status.setText("偵測中…（約 5-10 秒）")
         self.btn_test.setEnabled(False)
-        self._t = _Worker(lambda: onvif_dvr_probe(p), self)
-        self._t.done.connect(lambda res, err: self._test_done(p, res, err))
+        self.list.clear()
+        self._t = _Worker(lambda: self._detect(p), self)
+        self._t.done.connect(lambda res, err: self._done(res, err))
         self._t.start()
 
-    def _test_done(self, p, res, err):
+    def _detect(self, p):
+        from . import dvr as dvrmod
+        ok, msg = dvrmod.probe(p["host"], p["port"], p["user"], p["password"])
+        if not ok:
+            raise RuntimeError(msg)
+        return dvrmod.detect_channels(p, max_channels=16,
+                                      progress=lambda done, got: None)
+
+    def _done(self, res, err):
         self.btn_test.setEnabled(True)
         if err:
             self.status.setText("失敗：%s" % err)
             return
-        ok, msg = res
-        if ok and p["channels"] <= 0 and "通道: " in msg:
-            nums = [x for x in msg.split("通道: ", 1)[1].split(",") if x.strip().isdigit()]
-            if nums:
-                self.channels.setText(str(max(int(n) for n in nums) + 1))
-        self.status.setText(("成功：" if ok else "失敗：") + msg)
+        self.detected = res or []
+        if not self.detected:
+            self.status.setText("連上了，但沒有通道有影像")
+            return
+        self.status.setText("找到 %d 路有影像" % len(self.detected))
+        for d in self.detected:
+            weak = d["fps"] < 3
+            label = "CH%-2d  %d×%d  %.1f fps%s" % (d["channel"] + 1, d["width"], d["height"],
+                                                   d["fps"], "  ← 訊號極弱" if weak else "")
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, d["channel"])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            if self.checked:
+                item.setCheckState(Qt.Checked if d["channel"] in self.checked else Qt.Unchecked)
+            else:
+                item.setCheckState(Qt.Unchecked if weak else Qt.Checked)
+            self.list.addItem(item)
 
 
 def onvif_dvr_probe(p):
@@ -561,13 +715,25 @@ class MainWindow(QMainWindow):
 
         bar = self.addToolBar("main")
         bar.setMovable(False)
-        for text, slot in (("DVR 主機", self.setup_dvr), ("回放", self.open_playback),
-                           ("探索", self.open_discover), ("新增", self.add_camera),
-                           ("編輯", self.edit_camera), ("移除", self.remove_camera),
-                           ("截圖", self.snapshot), ("錄影", self.toggle_record),
-                           ("重新連線", self.reload_all)):
-            act = bar.addAction(text)
-            act.triggered.connect(slot)
+        bar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        for group in (
+            (("DVR 主機", "camera-video", "設定 DVR 主機（自動偵測通道）", self.setup_dvr),
+             ("回放", "media-playback-start", "看主機上的歷史錄影", self.open_playback)),
+            (("掃描網路攝影機", "edit-find", "掃描區網的 ONVIF 攝影機", self.open_discover),
+             ("新增網址", "list-add", "手動貼 RTSP 網址", self.add_camera)),
+            (("重新連線", "view-refresh", "全部重新連線", self.reload_all),
+             ("截圖", "camera-photo", "把目前選取的畫面存成 PNG（S）", self.snapshot),
+             ("錄影", "media-record", "開始／停止錄影目前選取的畫面（R）", self.toggle_record)),
+        ):
+            for text, icon_name, tip, slot in group:
+                act = QAction(_icon(icon_name), text, self)
+                act.setToolTip("%s — %s" % (text, tip))
+                act.setStatusTip(tip)
+                act.triggered.connect(slot)
+                bar.addAction(act)
+            bar.addSeparator()
+        self.status_label = QLabel("")
+        self.statusBar().addPermanentWidget(self.status_label)
         self.statusBar().showMessage(HINT)
 
         QShortcut(QKeySequence("F"), self, activated=self.toggle_fullscreen)
@@ -588,11 +754,51 @@ class MainWindow(QMainWindow):
         self.tiles = []
         for cam in self.cfg["cameras"]:
             t = CameraTile(cam, self.cfg)
+            t.renamed.connect(self._on_renamed)
+            t.ask_playback.connect(self.playback_for)
+            t.removed.connect(lambda tile: self._remove_tile(tile))
             self.tiles.append(t)
         self.layout_tiles()
+        self.update_status()
         if restart:
             for t in self.tiles:
                 t.start()
+
+    def update_status(self):
+        n = len(self.tiles)
+        dvr = (self.cfg.get("dvr") or {}).get("host")
+        left = ("%d 路畫面" % n) if n else "沒有鏡頭"
+        if dvr:
+            left += "　·　DVR %s" % dvr
+        self.status_label.setText(left)
+
+    def playback_for(self, tile):
+        ch = None
+        if tile.cam["url"].startswith("dvr://"):
+            try:
+                ch = int(tile.cam["url"].split("://", 1)[1].split("?")[0])
+            except ValueError:
+                ch = None
+        if ch is None:
+            QMessageBox.information(self, "回放", "這一格不是 DVR 通道，沒有主機錄影可以回放")
+            return
+        dlg = PlaybackWindow(self, self.cfg.get("dvr") or {}, ch,
+                             int(time.time()) - 600, int(time.time()))
+        dlg.exec()
+
+    def _on_renamed(self, tile):
+        config.save(self.cfg)
+        self.statusBar().showMessage("已改名為「%s」" % tile.cam.get("name", ""), 3000)
+
+    def _remove_tile(self, tile):
+        self.maximized_tile = None if self.maximized_tile is tile else self.maximized_tile
+        try:
+            self.cfg["cameras"].remove(tile.cam)
+        except ValueError:
+            pass
+        config.save(self.cfg)
+        self.build_tiles()
+        self.statusBar().showMessage("已移除「%s」" % tile.cam.get("name", ""), 3000)
 
     def layout_tiles(self):
         while self.grid.count():
@@ -603,6 +809,8 @@ class MainWindow(QMainWindow):
         shown = [self.maximized_tile] if self.maximized_tile else self.tiles
         n = len(shown)
         if not n:
+            self.welcome = WelcomePanel(self.setup_dvr, self.open_discover, self.add_camera)
+            self.grid.addWidget(self.welcome, 0, 0)
             return
         cols = 1 if n == 1 else (2 if n <= 4 else (3 if n <= 9 else 4))
         rows = (n + cols - 1) // cols
@@ -649,16 +857,19 @@ class MainWindow(QMainWindow):
         if not prof["host"]:
             return
         self.cfg["dvr"] = prof
-        n = prof.get("channels") or 1
+        chans = prof.get("channel_list") or list(range(max(1, prof.get("channels") or 1)))
         existing = {c["url"] for c in self.cfg["cameras"]}
-        for i in range(n):
-            url = "dvr://%d" % i
+        added = 0
+        for ch in chans:
+            url = "dvr://%d" % ch
             if url in existing:
                 continue
-            self.cfg["cameras"].append({"name": "CH%d" % (i + 1), "url": url})
+            self.cfg["cameras"].append({"name": "CH%d" % (ch + 1), "url": url})
+            added += 1
         config.save(self.cfg)
         self.build_tiles()
-        self.statusBar().showMessage("DVR %s 已設定，%d 路" % (prof["host"], n))
+        self.statusBar().showMessage(
+            "DVR %s：偵測到 %d 路，新增 %d 路到畫面" % (prof["host"], len(chans), added), 6000)
 
     def open_playback(self):
         if not (self.cfg.get("dvr") or {}).get("host"):

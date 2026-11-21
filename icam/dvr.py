@@ -10,7 +10,10 @@
 sub-chunk 標頭：type(0=I,1=P,2=音訊) / channel / width / height / size / next_step
 """
 
+import socket
 import struct
+import threading
+import time
 
 MAGIC_WORD = 0x00001234
 BOUNDARY = b"--myboundary"
@@ -140,6 +143,112 @@ def probe(host, port=80, user=None, password=None, scheme="http", timeout=6):
         return False, "串流格式不符（可能不是 iCatch 主機）"
     chans = sorted({c for t, c, _w, _h, _p in iter_sub_chunks(got[0]) if t in VIDEO_TYPES})
     return True, "OK，通道: %s" % (",".join(str(c) for c in chans) or "無")
+
+
+def _raw_fetch(host, port, path, user, password, deadline, max_bytes=6_000_000):
+    """用裸 socket 抓一段 HTTP 串流內容，時間到就斷。
+
+    為什麼不用 requests：沒接攝影機的通道會回 200 但一個 byte 都不送，
+    requests 的 read timeout 不會觸發（實測會卡 50 秒），連 close() 也叫不醒它。
+    回傳 (status_code, bytes)。
+    """
+    import base64
+
+    buf = bytearray()
+    t_end = time.monotonic() + deadline
+    s = socket.create_connection((host, port), timeout=max(1.0, deadline))
+    try:
+        cred = base64.b64encode(("%s:%s" % (user or "", password or "")).encode()).decode()
+        req = ("GET %s HTTP/1.1\r\nHost: %s:%d\r\nAuthorization: Basic %s\r\n"
+               "Accept: */*\r\nConnection: close\r\n\r\n" % (path, host, port, cred))
+        s.sendall(req.encode())
+        while time.monotonic() < t_end and len(buf) < max_bytes:
+            s.settimeout(max(0.2, min(1.0, t_end - time.monotonic())))
+            try:
+                data = s.recv(16384)
+            except socket.timeout:
+                continue
+            if not data:
+                break
+            buf += data
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    status = 0
+    if buf.startswith(b"HTTP/"):
+        try:
+            status = int(bytes(buf.split(b" ")[1]))
+        except (IndexError, ValueError):
+            status = 0
+    return status, bytes(buf)
+
+
+def detect_channels(profile, max_channels=16, probe_seconds=2.2, should_stop=None,
+                    progress=None, workers=4):
+    """自動偵測主機上有哪些通道有影像。
+
+    並行探測（一次 workers 路），每路 probe_seconds 秒，統計張數與解析度。回傳
+    [{'channel': 0, 'width': 944, 'height': 480, 'fps': 20.1, 'frames': 50}, ...]
+
+    沒接攝影機的通道回 200 但不送任何資料 → 靠硬性截止跳過；
+    一整批都空的就停（避免對 16 路全部空等的機器白等）。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    host = profile.get("host", "")
+    if not host:
+        return []
+    port = int(profile.get("port", 80))
+    path_tpl = ("/cgi-bin/net_video.cgi?hq=1&iframe=%d&pframe=%d&audio=0"
+                "&complete=0&beg=-1&end=-1&ivs=0")
+    user, password = profile.get("user", ""), profile.get("password", "")
+
+    def probe(ch):
+        mask = 1 << ch
+        t0 = time.monotonic()
+        try:
+            status, raw = _raw_fetch(host, port, path_tpl % (mask, mask), user, password,
+                                     probe_seconds + 1.0)
+        except OSError:
+            return None
+        if status != 200 or not raw:
+            return None
+        splitter = MultipartSplitter()
+        stats = {"frames": 0, "w": 0, "h": 0}
+        splitter.callback = lambda body: _count_video(body, stats)
+        splitter.feed(raw)
+        elapsed = max(0.5, time.monotonic() - t0)
+        if not stats["frames"]:
+            return None
+        return {"channel": ch, "width": stats["w"], "height": stats["h"],
+                "frames": stats["frames"], "fps": round(stats["frames"] / elapsed, 1)}
+
+    found = {}
+    ch = 0
+    while ch < int(max_channels):
+        if should_stop and should_stop():
+            break
+        batch = list(range(ch, min(ch + workers, int(max_channels))))
+        with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+            batch_res = list(pool.map(probe, batch))
+        got = [r for r in batch_res if r]
+        for r in got:
+            found[r["channel"]] = r
+        if progress:
+            progress(min(ch + workers, int(max_channels)), got)
+        if not got and found:
+            break
+        ch += workers
+    return [found[k] for k in sorted(found)]
+
+
+def _count_video(body, stats):
+    for stype, _channel, w, h, _payload in iter_sub_chunks(body):
+        if stype in VIDEO_TYPES:
+            stats["frames"] += 1
+            stats["w"], stats["h"] = w, h
 
 
 def pull_bodies(profile, channel, beg=None, end=None, seg_secs=300, fps=20.0,

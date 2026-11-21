@@ -19,7 +19,9 @@ Comment=網路監視器多路監看（Linux 原生）
 Exec=$(pwd)/run.sh
 Path=$(pwd)
 Terminal=false
+Icon=camera-video
 Categories=AudioVideo;Video;Network;
+StartupWMClass=icam
 EOF
 chmod +x run.sh
 echo "完成。從應用程式選單開 iCam，或執行 $(pwd)/run.sh"
